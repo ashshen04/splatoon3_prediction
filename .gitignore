@@ -1,3 +1,9 @@
+# Project-specific
+data/*.csv
+results/
+*.zip
+splatoon3.db
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
