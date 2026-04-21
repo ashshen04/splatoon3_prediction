@@ -36,11 +36,15 @@ _RENAME = {col: col.replace("-", "_").lower() for col in _KEEP_META + _PLAYER_CO
 _BATCH_SIZE = 2000
 
 
-def _get_insert_stmt(is_sqlite: bool):
-    """Return the correct dialect upsert (ignore duplicates)."""
+def _build_upsert_stmt(is_sqlite: bool, records: list[dict]):
+    """Build a dialect-specific upsert statement that ignores duplicates."""
     if is_sqlite:
-        return sqlite_insert(Battle)
-    return pg_insert(Battle)
+        stmt = sqlite_insert(Battle).values(records)
+        return stmt.on_conflict_do_nothing(
+            index_elements=["period", "a1_weapon", "a1_kill", "a1_death"]
+        )
+    stmt = pg_insert(Battle).values(records)
+    return stmt.on_conflict_do_nothing(constraint="uq_battle_dedup")
 
 
 def ingest_csv(csv_path: str | Path, batch_size: int = _BATCH_SIZE) -> None:
@@ -63,23 +67,29 @@ def ingest_csv(csv_path: str | Path, batch_size: int = _BATCH_SIZE) -> None:
     # Drop rows with no win outcome recorded
     df = df[df["win"].notna() & df["win"].isin(["alpha", "bravo"])]
 
+    # Deduplicate within this file by the same key as the DB unique constraint.
+    # Postgres ON CONFLICT DO NOTHING can raise IntegrityError on same-batch dupes.
+    dedup_keys = ["period", "a1_weapon", "a1_kill", "a1_death"]
+    before = len(df)
+    df = df.drop_duplicates(subset=dedup_keys, keep="first")
+    if before != len(df):
+        print(f"  Dropped {before - len(df):,} in-file duplicate rows.")
+
     is_sqlite = str(engine.url).startswith("sqlite")
     total = len(df)
     inserted = 0
 
+    # Replace pandas NaN with Python None so the DB driver treats them as NULL
+    df = df.astype(object).where(df.notna(), other=None)
+
     with SessionLocal() as session:
         for start in tqdm(range(0, total, batch_size), desc="Ingesting batches"):
             batch = df.iloc[start : start + batch_size]
-            records = batch.where(batch.notna(), other=None).to_dict(orient="records")
+            records = batch.to_dict(orient="records")
+            if not records:
+                continue
 
-            stmt = _get_insert_stmt(is_sqlite)(records)
-            if is_sqlite:
-                stmt = stmt.on_conflict_do_nothing(
-                    index_elements=["period", "a1_weapon", "a1_kill", "a1_death"]
-                )
-            else:
-                stmt = stmt.on_conflict_do_nothing(constraint="uq_battle_dedup")
-
+            stmt = _build_upsert_stmt(is_sqlite, records)
             result = session.execute(stmt)
             inserted += result.rowcount
             session.commit()

@@ -39,7 +39,6 @@ alembic downgrade -1                                # roll back one revision
 ```
 run_pipeline.py
     ├── src/db/session.py          — SQLAlchemy engine; reads DATABASE_URL from .env
-    ├── src/db/models.py           — ORM: Battle, FeatureRow, Prediction tables
     ├── src/data/ingest.py         — CSV → battles table (idempotent upsert)
     ├── src/preprocessing/cleaner.py — load from DB, drop leakage cols, impute, create target
     ├── src/features/

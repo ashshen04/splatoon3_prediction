@@ -55,8 +55,12 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     # ------------------------------------------------------------------ Weapon class counts
     for team, pids in [("alpha", _ALPHA_IDS), ("bravo", _BRAVO_IDS)]:
         weapon_cols = [f"{p}_weapon" for p in pids if f"{p}_weapon" in df.columns]
-        # Map each player's weapon to a class
-        class_df = df[weapon_cols].applymap(get_weapon_class)
+        # Map each player's weapon to a class. Use DataFrame.map (pandas 2.1+);
+        # falls back to applymap for older pandas.
+        try:
+            class_df = df[weapon_cols].map(get_weapon_class)
+        except AttributeError:
+            class_df = df[weapon_cols].applymap(get_weapon_class)
         for cls in WEAPON_CLASS_LIST:
             feat[f"{team}_{cls.lower()}_count"] = (class_df == cls).sum(axis=1).astype(float)
 
@@ -124,8 +128,14 @@ def _write_feature_rows(
     feat: pd.DataFrame,
     y: pd.Series,
 ) -> None:
-    """Persist engineered features to feature_rows table."""
-    print("Writing feature rows to DB...")
+    """Persist engineered features to feature_rows table.
+
+    Truncates the table first so re-runs don't duplicate rows.
+    """
+    print("Writing feature rows to DB (clearing existing rows first)...")
+    with SessionLocal() as session:
+        session.execute(text("DELETE FROM feature_rows"))
+        session.commit()
 
     # Separate out the one-hot columns from the numeric columns
     onehot_mode_cols = [c for c in feat.columns if c.startswith("mode_")]

@@ -35,8 +35,8 @@ def main() -> None:
         help="Skip feature engineering; load pre-computed feature_rows from DB."
     )
     parser.add_argument(
-        "--data-dir", default="data",
-        help="Directory containing stat.ink CSV files (default: data/)."
+        "--data-dir", default="data/raw/battle-results-csv",
+        help="Directory containing stat.ink CSV files (default: data/raw/battle-results-csv)."
     )
     args = parser.parse_args()
 
