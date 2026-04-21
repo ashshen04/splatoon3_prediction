@@ -5,15 +5,18 @@ results to the feature_rows table, and returns (X, y) for model training.
 """
 
 import json
+import time
 
 import pandas as pd
 from sqlalchemy import text
-from tqdm import tqdm
+from sqlalchemy.exc import SQLAlchemyError
 
-from src.db.models import FeatureRow
 from src.db.session import SessionLocal, engine
 from src.features.weapon_classes import WEAPON_CLASS_LIST, get_weapon_class
+from src.logging_config import get_logger
 from src.preprocessing.cleaner import clean, load_battles
+
+logger = get_logger(__name__)
 
 _ALPHA_IDS = ["a1", "a2", "a3", "a4"]
 _BRAVO_IDS = ["b1", "b2", "b3", "b4"]
@@ -90,17 +93,26 @@ def engineer_features(
         raw = load_battles()
         df = clean(raw)
 
-    print("Engineering features...")
+    logger.info("Engineering features for %d rows...", len(df))
+    t0 = time.perf_counter()
     feat = _build_features(df)
-    y = df["target"]
+    logger.info("  Built %d feature columns in %.1fs",
+                feat.shape[1], time.perf_counter() - t0)
 
-    # Ensure no NaN values remain
+    # Sanity check: warn if all weapon counts are zero (weapon mapping failure)
+    weapon_cols = [c for c in feat.columns if c.endswith("_count")]
+    if weapon_cols and feat[weapon_cols].sum().sum() == 0:
+        logger.warning(
+            "All weapon class counts are zero — weapon_classes mapping may be out of date."
+        )
+
+    y = df["target"]
     feat = feat.fillna(0.0)
 
     if write_to_db:
         _write_feature_rows(df, feat, y)
 
-    print(f"Feature matrix: {feat.shape[0]:,} rows × {feat.shape[1]} features.")
+    logger.info("Feature matrix: %d rows × %d features.", feat.shape[0], feat.shape[1])
     return feat, y
 
 
@@ -115,11 +127,10 @@ def load_feature_rows() -> tuple[pd.DataFrame, pd.Series]:
         )
 
     y = df.pop("target").astype(int)
-    # Drop metadata columns not used as features
     df.drop(columns=["id", "battle_id", "mode_onehot", "stage_onehot", "lobby_onehot"],
             errors="ignore", inplace=True)
 
-    print(f"Loaded {len(df):,} feature rows from DB.")
+    logger.info("Loaded %d feature rows from DB.", len(df))
     return df, y
 
 
@@ -128,16 +139,27 @@ def _write_feature_rows(
     feat: pd.DataFrame,
     y: pd.Series,
 ) -> None:
-    """Persist engineered features to feature_rows table.
+    """Persist engineered features to feature_rows table using vectorized writes.
 
-    Truncates the table first so re-runs don't duplicate rows.
+    Strategy:
+      1. DELETE existing feature_rows (idempotent rerun).
+      2. Build a single DataFrame of the rows to insert.
+      3. Use DataFrame.to_sql with chunksize + method='multi' for fast inserts.
     """
-    print("Writing feature rows to DB (clearing existing rows first)...")
-    with SessionLocal() as session:
-        session.execute(text("DELETE FROM feature_rows"))
-        session.commit()
+    if "id" not in battles_df.columns:
+        logger.warning("No 'id' column in battles_df; skipping DB write.")
+        return
 
-    # Separate out the one-hot columns from the numeric columns
+    logger.info("Clearing existing feature_rows before insert...")
+    try:
+        with SessionLocal() as session:
+            session.execute(text("DELETE FROM feature_rows"))
+            session.commit()
+    except SQLAlchemyError:
+        logger.exception("Failed to clear feature_rows table.")
+        raise
+
+    # Separate one-hot columns from the plain numeric columns
     onehot_mode_cols = [c for c in feat.columns if c.startswith("mode_")]
     onehot_stage_cols = [c for c in feat.columns if c.startswith("stage_")]
     onehot_lobby_cols = [c for c in feat.columns if c.startswith("lobby_")]
@@ -146,31 +168,34 @@ def _write_feature_rows(
         if not (c.startswith("mode_") or c.startswith("stage_") or c.startswith("lobby_"))
     ]
 
-    # We need battle IDs to write FKs — assumes battles_df has an 'id' column
-    if "id" not in battles_df.columns:
-        print("Warning: no 'id' column in battles_df; skipping DB write.")
-        return
+    # Start with the numeric feature columns (already a DataFrame — no per-row loop)
+    out = feat[numeric_cols].copy()
 
-    rows = []
-    for idx in feat.index:
-        row = {col: feat.at[idx, col] for col in numeric_cols}
-        row["battle_id"] = int(battles_df.at[idx, "id"])
-        row["target"] = int(y.at[idx])
-        row["mode_onehot"] = json.dumps(
-            {c: feat.at[idx, c] for c in onehot_mode_cols}
-        ) if onehot_mode_cols else None
-        row["stage_onehot"] = json.dumps(
-            {c: feat.at[idx, c] for c in onehot_stage_cols}
-        ) if onehot_stage_cols else None
-        row["lobby_onehot"] = json.dumps(
-            {c: feat.at[idx, c] for c in onehot_lobby_cols}
-        ) if onehot_lobby_cols else None
-        rows.append(row)
+    # Attach FK, target, and JSON-serialized one-hot columns (all vectorized)
+    out["battle_id"] = battles_df["id"].to_numpy()
+    out["target"] = y.to_numpy()
 
-    with SessionLocal() as session:
-        for start in tqdm(range(0, len(rows), _BATCH_SIZE), desc="Writing feature_rows"):
-            batch = rows[start : start + _BATCH_SIZE]
-            session.bulk_insert_mappings(FeatureRow, batch)
-            session.commit()
+    def _rows_to_json(sub: pd.DataFrame) -> pd.Series:
+        # Convert DataFrame rows → JSON strings, vectorized via to_dict + map
+        return pd.Series(sub.to_dict(orient="records"), index=sub.index).map(json.dumps)
 
-    print(f"Wrote {len(rows):,} feature rows to DB.")
+    out["mode_onehot"] = _rows_to_json(feat[onehot_mode_cols]) if onehot_mode_cols else None
+    out["stage_onehot"] = _rows_to_json(feat[onehot_stage_cols]) if onehot_stage_cols else None
+    out["lobby_onehot"] = _rows_to_json(feat[onehot_lobby_cols]) if onehot_lobby_cols else None
+
+    t0 = time.perf_counter()
+    logger.info("Writing %d rows to feature_rows table (vectorized bulk insert)...",
+                len(out))
+    try:
+        out.to_sql(
+            "feature_rows",
+            engine,
+            if_exists="append",
+            index=False,
+            chunksize=10000,
+            method="multi",
+        )
+    except SQLAlchemyError:
+        logger.exception("Bulk insert into feature_rows failed.")
+        raise
+    logger.info("Wrote %d feature rows in %.1fs.", len(out), time.perf_counter() - t0)

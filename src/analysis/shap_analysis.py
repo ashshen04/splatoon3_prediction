@@ -5,6 +5,7 @@ Generates:
   - results/shap_dependence_<feature>.png  — dependence plot for top feature
 """
 
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,6 +13,10 @@ import numpy as np
 import pandas as pd
 import shap
 from sklearn.pipeline import Pipeline
+
+from src.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 RESULTS_DIR = Path("results")
 SAMPLE_SIZE = 5000
@@ -49,7 +54,9 @@ def run_shap_analysis(
 
     # Choose explainer
     estimator_type = type(estimator).__name__
-    print(f"  Running SHAP with TreeExplainer on {model_name} ({estimator_type})...")
+    logger.info("Running SHAP on %s (%s) — sample size %d",
+                model_name, estimator_type, n)
+    t0 = time.perf_counter()
 
     if hasattr(estimator, "feature_importances_"):
         explainer = shap.TreeExplainer(estimator)
@@ -76,13 +83,13 @@ def run_shap_analysis(
     summary_path = RESULTS_DIR / "shap_summary.png"
     plt.savefig(summary_path, bbox_inches="tight", dpi=150)
     plt.close()
-    print(f"  Saved → {summary_path}")
+    logger.info("Saved → %s", summary_path)
 
     # ------------------------------------------------------------------ Dependence plot (top feature)
     mean_abs_shap = np.abs(shap_values).mean(axis=0)
     top_idx = int(np.argmax(mean_abs_shap))
     top_feature = feature_names[top_idx]
-    print(f"  Top SHAP feature: '{top_feature}'")
+    logger.info("Top SHAP feature: %s", top_feature)
 
     plt.figure(figsize=(8, 5))
     shap.dependence_plot(
@@ -95,4 +102,5 @@ def run_shap_analysis(
     dep_path = RESULTS_DIR / f"shap_dependence_{top_feature}.png"
     plt.savefig(dep_path, bbox_inches="tight", dpi=150)
     plt.close()
-    print(f"  Saved → {dep_path}")
+    logger.info("Saved → %s", dep_path)
+    logger.info("SHAP analysis complete in %.1fs", time.perf_counter() - t0)

@@ -8,16 +8,33 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
+import sys
+import time
 
 from src.db.models import Base
-from src.db.session import engine
+from src.db.session import check_db_connection, engine
+from src.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def setup_db() -> None:
     """Create all tables if they don't exist."""
     Base.metadata.create_all(engine)
-    print("Database tables ready.")
+    logger.info("Database tables ready.")
+
+
+def _run_step(label: str, fn, *args, **kwargs):
+    """Run a pipeline step with timing + error logging. Exits on failure."""
+    logger.info("=== %s ===", label)
+    t0 = time.perf_counter()
+    try:
+        result = fn(*args, **kwargs)
+    except Exception:
+        logger.exception("Step failed: %s", label)
+        sys.exit(1)
+    logger.info("%s finished in %.1fs", label, time.perf_counter() - t0)
+    return result
 
 
 def main() -> None:
@@ -40,42 +57,51 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------ DB setup
-    setup_db()
+    pipeline_t0 = time.perf_counter()
+    logger.info("Starting Splatoon 3 prediction pipeline.")
+
+    # ------------------------------------------------------------------ Pre-flight
+    try:
+        check_db_connection()
+    except Exception:
+        logger.exception("Pre-flight DB check failed — aborting.")
+        sys.exit(1)
+
+    _run_step("Step 0: DB setup", setup_db)
 
     # ------------------------------------------------------------------ Ingest
     if not args.skip_ingest:
         from src.data.ingest import ingest_directory
-        print("\n--- Step 1: Ingest CSV → DB ---")
-        ingest_directory(args.data_dir)
+        _run_step("Step 1: Ingest CSV → DB", ingest_directory, args.data_dir)
     else:
-        print("\n--- Step 1: Skipping CSV ingest ---")
+        logger.info("=== Step 1: Skipping CSV ingest ===")
 
     if args.ingest_only:
-        print("--ingest-only flag set. Done.")
+        logger.info("--ingest-only flag set. Done in %.1fs.",
+                    time.perf_counter() - pipeline_t0)
         return
 
     # ------------------------------------------------------------------ Features
     if args.skip_features:
-        print("\n--- Step 2: Loading pre-computed features from DB ---")
         from src.features.engineer import load_feature_rows
-        X, y = load_feature_rows()
+        X, y = _run_step("Step 2: Load pre-computed features from DB", load_feature_rows)
     else:
-        print("\n--- Step 2: Feature engineering ---")
         from src.features.engineer import engineer_features
-        X, y = engineer_features(write_to_db=True)
+        X, y = _run_step("Step 2: Feature engineering", engineer_features, write_to_db=True)
 
     # ------------------------------------------------------------------ Training
-    print("\n--- Step 3: Model training ---")
     from src.modeling.trainer import run_training
-    metrics_df, best_model, best_name = run_training(X, y)
+    _, best_model, best_name = _run_step("Step 3: Model training", run_training, X, y)
 
     # ------------------------------------------------------------------ SHAP
-    print(f"\n--- Step 4: SHAP analysis on {best_name} ---")
     from src.analysis.shap_analysis import run_shap_analysis
-    run_shap_analysis(best_model, X, model_name=best_name)
+    _run_step(
+        f"Step 4: SHAP analysis on {best_name}",
+        run_shap_analysis, best_model, X, model_name=best_name,
+    )
 
-    print("\n=== Pipeline complete. Results saved to results/ ===")
+    logger.info("Pipeline complete in %.1fs. Results saved to results/.",
+                time.perf_counter() - pipeline_t0)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ Uses 5-fold stratified cross-validation. Saves the best model and feature
 column list to results/ for use by the backend.
 """
 
+import time
 from pathlib import Path
 
 import joblib
@@ -15,6 +16,10 @@ from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
+
+from src.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 RESULTS_DIR = Path("results")
 
@@ -50,15 +55,27 @@ def train_and_evaluate(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     results = []
 
     for name, model in MODELS.items():
-        print(f"  Cross-validating {name}...")
-        scores = cross_validate(
-            model,
-            X,
-            y,
-            cv=cv,
-            scoring=["accuracy", "f1_macro"],
-            return_train_score=False,
-            n_jobs=-1,
+        t0 = time.perf_counter()
+        logger.info("Cross-validating %s...", name)
+        try:
+            scores = cross_validate(
+                model,
+                X,
+                y,
+                cv=cv,
+                scoring=["accuracy", "f1_macro"],
+                return_train_score=False,
+                n_jobs=-1,
+            )
+        except Exception:
+            logger.exception("Cross-validation for %s failed.", name)
+            raise
+        logger.info(
+            "  %s: acc=%.4f±%.4f  f1=%.4f±%.4f  (%.1fs)",
+            name,
+            scores["test_accuracy"].mean(), scores["test_accuracy"].std(),
+            scores["test_f1_macro"].mean(), scores["test_f1_macro"].std(),
+            time.perf_counter() - t0,
         )
         results.append(
             {
@@ -82,9 +99,11 @@ def get_best_model(
     best_name = metrics_df.loc[
         metrics_df["CV F1 Macro"].astype(float).idxmax(), "Model"
     ]
-    print(f"  Best model: {best_name}. Refitting on full dataset...")
+    logger.info("Best model: %s — refitting on full dataset...", best_name)
+    t0 = time.perf_counter()
     best_model = MODELS[best_name]
     best_model.fit(X, y)
+    logger.info("  Refit complete in %.1fs", time.perf_counter() - t0)
 
     RESULTS_DIR.mkdir(exist_ok=True)
     model_path = RESULTS_DIR / "best_model.joblib"
@@ -92,8 +111,8 @@ def get_best_model(
 
     joblib.dump(best_model, model_path)
     joblib.dump(X.columns.tolist(), cols_path)
-    print(f"  Saved model → {model_path}")
-    print(f"  Saved feature columns → {cols_path}")
+    logger.info("Saved model → %s", model_path)
+    logger.info("Saved feature columns → %s", cols_path)
 
     return best_model, best_name
 
@@ -106,14 +125,15 @@ def run_training(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, any, str]
         best_model: fitted best model
         best_name: name of best model
     """
-    print("Training models (5-fold CV)...")
+    logger.info("Training models (5-fold CV) on %d rows × %d features...",
+                X.shape[0], X.shape[1])
     metrics_df = train_and_evaluate(X, y)
 
     RESULTS_DIR.mkdir(exist_ok=True)
     csv_path = RESULTS_DIR / "model_performance.csv"
     metrics_df.to_csv(csv_path, index=False)
-    print(f"\nModel performance:\n{metrics_df.to_string(index=False)}")
-    print(f"\nSaved → {csv_path}")
+    logger.info("Model performance:\n%s", metrics_df.to_string(index=False))
+    logger.info("Saved → %s", csv_path)
 
     best_model, best_name = get_best_model(metrics_df, X, y)
     return metrics_df, best_model, best_name

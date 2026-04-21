@@ -8,8 +8,13 @@ a running Postgres instance during local development.
 import os
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
+
+from src.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -22,21 +27,33 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    # SQLite doesn't support connection pools the same way
     **({} if DATABASE_URL.startswith("sqlite") else {"pool_size": 5, "max_overflow": 10}),
 )
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
-def get_session():
-    """Context-manager-friendly session getter."""
-    session = SessionLocal()
+def check_db_connection() -> None:
+    """Verify the DB is reachable. Raises with a clear message if not."""
     try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except OperationalError as e:
+        logger.error(
+            "Cannot connect to database at %s — is Postgres running?",
+            _redacted_url(),
+        )
+        raise RuntimeError(f"Database connection failed: {e}") from e
+    except SQLAlchemyError as e:
+        logger.error("Database error while connecting: %s", e)
         raise
-    finally:
-        session.close()
+
+    logger.info("Connected to database: %s", _redacted_url())
+
+
+def _redacted_url() -> str:
+    """Return the DATABASE_URL with password hidden for safe logging."""
+    url = engine.url
+    if url.password:
+        return str(url).replace(url.password, "***")
+    return str(url)

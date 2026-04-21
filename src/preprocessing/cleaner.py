@@ -3,10 +3,16 @@
 Returns a cleaned DataFrame ready for feature engineering.
 """
 
+import time
+
 import pandas as pd
 from sqlalchemy import text
+from tqdm import tqdm
 
 from src.db.session import engine
+from src.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 _PLAYER_IDS = ["a1", "a2", "a3", "a4", "b1", "b2", "b3", "b4"]
 
@@ -17,11 +23,30 @@ _DROP_COLS = [
 ]
 
 
+_LOAD_CHUNK = 100_000
+
+
 def load_battles() -> pd.DataFrame:
-    """Load all battles from the DB into a DataFrame."""
+    """Load all battles from the DB into a DataFrame, chunked with progress bar."""
+    t0 = time.perf_counter()
     with engine.connect() as conn:
-        df = pd.read_sql(text("SELECT * FROM battles"), conn)
-    print(f"Loaded {len(df):,} battles from DB.")
+        total = conn.execute(text("SELECT COUNT(*) FROM battles")).scalar_one()
+        if total == 0:
+            raise RuntimeError(
+                "battles table is empty. Run `python run_pipeline.py --ingest-only` first."
+            )
+        logger.info("Loading %d battles from DB (chunks of %d)...", total, _LOAD_CHUNK)
+
+        chunks = []
+        with tqdm(total=total, desc="  load_battles", unit="rows") as pbar:
+            for chunk in pd.read_sql(
+                text("SELECT * FROM battles"), conn, chunksize=_LOAD_CHUNK,
+            ):
+                chunks.append(chunk)
+                pbar.update(len(chunk))
+
+    df = pd.concat(chunks, ignore_index=True)
+    logger.info("Loaded %d battles in %.1fs", len(df), time.perf_counter() - t0)
     return df
 
 
@@ -74,8 +99,8 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["target"] = (df["win"] == "alpha").astype(int)
     df.drop(columns=["win"], inplace=True)
 
-    print(
-        f"After cleaning: {len(df):,} rows. "
-        f"Target balance: {df['target'].mean():.1%} alpha wins."
+    logger.info(
+        "After cleaning: %d rows. Target balance: %.1f%% alpha wins.",
+        len(df), df["target"].mean() * 100,
     )
     return df
