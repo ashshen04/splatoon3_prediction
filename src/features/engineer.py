@@ -4,12 +4,14 @@ Reads from the battles table (via cleaner.py), computes features, writes
 results to the feature_rows table, and returns (X, y) for model training.
 """
 
+import io
 import json
 import time
 
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from tqdm import tqdm
 
 from src.db.session import SessionLocal, engine
 from src.features.weapon_classes import WEAPON_CLASS_LIST, get_weapon_class
@@ -116,22 +118,65 @@ def engineer_features(
     return feat, y
 
 
+_LOAD_CHUNK = 100_000
+
+
 def load_feature_rows() -> tuple[pd.DataFrame, pd.Series]:
-    """Load pre-computed feature rows from the DB (skip re-engineering)."""
+    """Load pre-computed feature rows from the DB (skip re-engineering), chunked with progress."""
+    t0 = time.perf_counter()
+    # Skip JSON one-hot columns in the SELECT — training doesn't use them and they
+    # bloat the transfer considerably.
+    drop_cols = ["id", "battle_id", "mode_onehot", "stage_onehot", "lobby_onehot"]
+
     with engine.connect() as conn:
-        df = pd.read_sql(text("SELECT * FROM feature_rows"), conn)
+        total = conn.execute(text("SELECT COUNT(*) FROM feature_rows")).scalar_one()
+        if total == 0:
+            raise RuntimeError(
+                "feature_rows table is empty. Run engineer_features(write_to_db=True) first."
+            )
+        logger.info("Loading %d feature rows from DB (chunks of %d)...", total, _LOAD_CHUNK)
 
-    if df.empty:
-        raise RuntimeError(
-            "feature_rows table is empty. Run engineer_features(write_to_db=True) first."
-        )
+        chunks = []
+        with tqdm(total=total, desc="  feature_rows", unit="rows") as pbar:
+            for chunk in pd.read_sql(
+                text("SELECT * FROM feature_rows"), conn, chunksize=_LOAD_CHUNK,
+            ):
+                chunk.drop(columns=drop_cols, errors="ignore", inplace=True)
+                chunks.append(chunk)
+                pbar.update(len(chunk))
 
+    df = pd.concat(chunks, ignore_index=True)
     y = df.pop("target").astype(int)
-    df.drop(columns=["id", "battle_id", "mode_onehot", "stage_onehot", "lobby_onehot"],
-            errors="ignore", inplace=True)
-
-    logger.info("Loaded %d feature rows from DB.", len(df))
+    logger.info("Loaded %d feature rows in %.1fs.", len(df), time.perf_counter() - t0)
     return df, y
+
+
+_WRITE_CHUNK = 100_000
+
+
+def _bulk_copy_postgres(df: pd.DataFrame, table_name: str) -> None:
+    """Postgres bulk insert via COPY FROM STDIN. ~20–50× faster than INSERT-based writes."""
+    cols_sql = ", ".join(f'"{c}"' for c in df.columns)
+    copy_sql = f"COPY {table_name} ({cols_sql}) FROM STDIN WITH (FORMAT CSV)"
+
+    raw_conn = engine.raw_connection()
+    try:
+        with raw_conn.cursor() as cur:
+            total = len(df)
+            with tqdm(total=total, desc="  feature_rows", unit="rows") as pbar:
+                for start in range(0, total, _WRITE_CHUNK):
+                    chunk = df.iloc[start : start + _WRITE_CHUNK]
+                    buf = io.StringIO()
+                    chunk.to_csv(buf, index=False, header=False)
+                    buf.seek(0)
+                    cur.copy_expert(copy_sql, buf)
+                    pbar.update(len(chunk))
+        raw_conn.commit()
+    except Exception:
+        raw_conn.rollback()
+        raise
+    finally:
+        raw_conn.close()
 
 
 def _write_feature_rows(
@@ -139,27 +184,29 @@ def _write_feature_rows(
     feat: pd.DataFrame,
     y: pd.Series,
 ) -> None:
-    """Persist engineered features to feature_rows table using vectorized writes.
+    """Persist engineered features to feature_rows.
 
-    Strategy:
-      1. DELETE existing feature_rows (idempotent rerun).
-      2. Build a single DataFrame of the rows to insert.
-      3. Use DataFrame.to_sql with chunksize + method='multi' for fast inserts.
+    Uses Postgres COPY FROM STDIN for speed; falls back to DataFrame.to_sql on SQLite.
     """
     if "id" not in battles_df.columns:
         logger.warning("No 'id' column in battles_df; skipping DB write.")
         return
 
+    is_postgres = engine.dialect.name == "postgresql"
+
     logger.info("Clearing existing feature_rows before insert...")
     try:
         with SessionLocal() as session:
-            session.execute(text("DELETE FROM feature_rows"))
+            if is_postgres:
+                # TRUNCATE is effectively instant; DELETE on 4M+ rows took ~54s.
+                session.execute(text("TRUNCATE TABLE feature_rows RESTART IDENTITY"))
+            else:
+                session.execute(text("DELETE FROM feature_rows"))
             session.commit()
     except SQLAlchemyError:
         logger.exception("Failed to clear feature_rows table.")
         raise
 
-    # Separate one-hot columns from the plain numeric columns
     onehot_mode_cols = [c for c in feat.columns if c.startswith("mode_")]
     onehot_stage_cols = [c for c in feat.columns if c.startswith("stage_")]
     onehot_lobby_cols = [c for c in feat.columns if c.startswith("lobby_")]
@@ -168,15 +215,11 @@ def _write_feature_rows(
         if not (c.startswith("mode_") or c.startswith("stage_") or c.startswith("lobby_"))
     ]
 
-    # Start with the numeric feature columns (already a DataFrame — no per-row loop)
     out = feat[numeric_cols].copy()
-
-    # Attach FK, target, and JSON-serialized one-hot columns (all vectorized)
     out["battle_id"] = battles_df["id"].to_numpy()
     out["target"] = y.to_numpy()
 
     def _rows_to_json(sub: pd.DataFrame) -> pd.Series:
-        # Convert DataFrame rows → JSON strings, vectorized via to_dict + map
         return pd.Series(sub.to_dict(orient="records"), index=sub.index).map(json.dumps)
 
     out["mode_onehot"] = _rows_to_json(feat[onehot_mode_cols]) if onehot_mode_cols else None
@@ -184,18 +227,24 @@ def _write_feature_rows(
     out["lobby_onehot"] = _rows_to_json(feat[onehot_lobby_cols]) if onehot_lobby_cols else None
 
     t0 = time.perf_counter()
-    logger.info("Writing %d rows to feature_rows table (vectorized bulk insert)...",
-                len(out))
+    logger.info(
+        "Writing %d rows to feature_rows (%s, chunks of %d)...",
+        len(out),
+        "Postgres COPY" if is_postgres else "to_sql",
+        _WRITE_CHUNK,
+    )
     try:
-        out.to_sql(
-            "feature_rows",
-            engine,
-            if_exists="append",
-            index=False,
-            chunksize=10000,
-            method="multi",
-        )
-    except SQLAlchemyError:
+        if is_postgres:
+            _bulk_copy_postgres(out, "feature_rows")
+        else:
+            out.to_sql(
+                "feature_rows",
+                engine,
+                if_exists="append",
+                index=False,
+                chunksize=5000,
+            )
+    except Exception:
         logger.exception("Bulk insert into feature_rows failed.")
         raise
     logger.info("Wrote %d feature rows in %.1fs.", len(out), time.perf_counter() - t0)

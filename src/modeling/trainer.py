@@ -23,6 +23,10 @@ logger = get_logger(__name__)
 
 RESULTS_DIR = Path("results")
 
+# Cap for CV subsample. Empirically, CV metrics are stable past ~200k rows; going
+# from 500k → 4.6M would multiply RF training time by ~9× for negligible gain.
+_CV_SAMPLE_CAP = 500_000
+
 MODELS: dict[str, any] = {
     "Logistic Regression": Pipeline(
         [
@@ -31,7 +35,8 @@ MODELS: dict[str, any] = {
         ]
     ),
     "Random Forest": RandomForestClassifier(
-        n_estimators=200,
+        n_estimators=100,
+        max_depth=25,
         random_state=42,
         n_jobs=-1,
     ),
@@ -49,23 +54,40 @@ MODELS: dict[str, any] = {
 }
 
 
-def train_and_evaluate(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+def _maybe_subsample(
+    X: pd.DataFrame, y: pd.Series, cap: int,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Stratified-ish subsample if len(X) > cap. Uses simple random sampling."""
+    if len(X) <= cap:
+        return X, y
+    logger.info("Subsampling %d → %d rows for CV (set higher to use more data).",
+                len(X), cap)
+    idx = X.sample(n=cap, random_state=42).index
+    return X.loc[idx].reset_index(drop=True), y.loc[idx].reset_index(drop=True)
+
+
+def train_and_evaluate(
+    X: pd.DataFrame, y: pd.Series, sample_cap: int = _CV_SAMPLE_CAP,
+) -> pd.DataFrame:
     """Run 5-fold CV on all models; return a performance metrics DataFrame."""
+    X_cv, y_cv = _maybe_subsample(X, y, sample_cap)
+
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     results = []
 
     for name, model in MODELS.items():
         t0 = time.perf_counter()
-        logger.info("Cross-validating %s...", name)
+        logger.info("Cross-validating %s on %d rows...", name, len(X_cv))
         try:
             scores = cross_validate(
                 model,
-                X,
-                y,
+                X_cv,
+                y_cv,
                 cv=cv,
                 scoring=["accuracy", "f1_macro"],
                 return_train_score=False,
                 n_jobs=-1,
+                verbose=1,
             )
         except Exception:
             logger.exception("Cross-validation for %s failed.", name)
@@ -117,17 +139,17 @@ def get_best_model(
     return best_model, best_name
 
 
-def run_training(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, any, str]:
+def run_training(
+    X: pd.DataFrame, y: pd.Series, sample_cap: int = _CV_SAMPLE_CAP,
+) -> tuple[pd.DataFrame, any, str]:
     """Full training flow: CV evaluation + best model refit.
 
-    Returns:
-        metrics_df: performance table
-        best_model: fitted best model
-        best_name: name of best model
+    Both CV and final refit use the same subsample (if X exceeds sample_cap).
     """
     logger.info("Training models (5-fold CV) on %d rows × %d features...",
                 X.shape[0], X.shape[1])
-    metrics_df = train_and_evaluate(X, y)
+    X_cv, y_cv = _maybe_subsample(X, y, sample_cap)
+    metrics_df = train_and_evaluate(X_cv, y_cv, sample_cap=sample_cap)
 
     RESULTS_DIR.mkdir(exist_ok=True)
     csv_path = RESULTS_DIR / "model_performance.csv"
@@ -135,5 +157,5 @@ def run_training(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, any, str]
     logger.info("Model performance:\n%s", metrics_df.to_string(index=False))
     logger.info("Saved → %s", csv_path)
 
-    best_model, best_name = get_best_model(metrics_df, X, y)
+    best_model, best_name = get_best_model(metrics_df, X_cv, y_cv)
     return metrics_df, best_model, best_name
